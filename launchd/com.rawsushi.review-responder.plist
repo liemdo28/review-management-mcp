@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent — runs the review auto-responder every 12 hours.
+
+  INSTALL:
+    1. Edit the path in ProgramArguments below to match where your
+       review-management-mcp folder lives on your Mac.
+    2. Copy this file to ~/Library/LaunchAgents/
+    3. Load it:
+         launchctl load ~/Library/LaunchAgents/com.rawsushi.review-responder.plist
+
+  TO STOP:
+    launchctl unload ~/Library/LaunchAgents/com.rawsushi.review-responder.plist
+
+  TO RUN MANUALLY NOW:
+    launchctl start com.rawsushi.review-responder
+
+  LOGS:
+    tail -f ~/review-management-mcp/logs/auto-respond.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rawsushi.review-responder</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- UPDATE THIS PATH to where your project lives -->
+    <string>/Users/hoangle/review-management-mcp/scripts/auto-respond.sh</string>
+  </array>
+
+  <!-- Run at 8am and 8pm every day -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key>
+      <integer>8</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>20</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+  </array>
+
+  <key>StandardOutPath</key>
+  <!-- UPDATE THIS PATH too -->
+  <string>/Users/hoangle/review-management-mcp/logs/launchd-out.log</string>
+
+  <key>StandardErrorPath</key>
+  <!-- UPDATE THIS PATH too -->
+  <string>/Users/hoangle/review-management-mcp/logs/launchd-err.log</string>
+
+  <!-- Restart if it crashes -->
+  <key>KeepAlive</key>
+  <false/>
+
+  <!-- Run after login -->
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

@@ -1,0 +1,33 @@
+name: Weekly Python Job
+
+on:
+  schedule:
+    # Chạy mỗi Chủ nhật lúc 02:00 sáng giờ Việt Nam
+    # Việt Nam = UTC+7
+    # 02:00 Sunday ICT = 19:00 Saturday UTC
+    - cron: '0 19 * * 6'
+  workflow_dispatch:
+
+jobs:
+  run-python-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run script
+        env:
+          DEMO_SECRET: ${{ secrets.DEMO_SECRET }}
+        run: |
+          python main.py
