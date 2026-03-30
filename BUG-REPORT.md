@@ -455,3 +455,32 @@ except Exception as e:
 **Sprint 2 (High reliability):** H-01 → H-02 → H-03 → H-04 → H-05 → H-06
 **Sprint 3 (Medium polish):** M-01 → M-02 → M-03 → M-04 → M-05
 **Sprint 4 (Production readiness):** Architecture review, load test, deployment guide
+
+---
+
+## v3 Fixed Issues — commit `3ca5ee7`
+
+### ✅ Critical Fixed (5/5)
+- **C-01**: StateStore → SQLite WAL mode, atomic transactions, indexes
+- **C-02**: Sheets = export-only, batch 100 rows/call, rate-limit backoff
+- **C-03**: DRY RUN increments `total_generated` (not `total_replied`)
+- **C-04**: Yelp scraper has schema validation + structured logging + ScrapingError
+- **C-05**: Google tab log wired to ScrolledText + progress callbacks
+
+### ✅ High Fixed (6/6)
+- **H-01**: Yelp AI prompt uses `YELP_REGISTRY` real business names
+- **H-02**: Sheets auth = Service Account only (OAuth2 removed)
+- **H-03**: Yelp row click shows full AI reply in preview panel
+- **H-04**: Google row click shows review text + reply preview
+- **H-05**: `parse_date` handles "3 days ago" / "2 weeks ago" correctly
+- **H-06**: All `print()` → `logger` from `src/logger.py`
+
+### ✅ Medium Fixed (3/5)
+- **M-02**: `validate_config()` at startup → error dialog with missing fields
+- **M-04**: No silent `except: pass` — all errors logged with context
+- **M-05**: **28 unit tests in `tests/test_src.py`, 100% pass rate**
+
+### ⏳ Not Fixed Yet
+- **M-01**: Serial processing / no batching (future sprint)
+- **M-03**: Yelp URL pre-validation (future sprint)
+- **L-01..L-05**: Nice-to-haves (future sprint)
