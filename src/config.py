@@ -20,7 +20,7 @@ class Settings(BaseModel):
     google_location_id_bakudan_stone_oak: str = os.getenv("GOOGLE_LOCATION_ID_BAKUDAN_STONE_OAK", "")
 
     dry_run: bool = os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes")
-    state_file: str = os.getenv("STATE_FILE", "state/review_state.json")
+    state_file: str = os.getenv("STATE_FILE", "state/reviews.db")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     log_file: str = os.getenv("LOG_FILE", "logs/app.log")
 

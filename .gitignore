@@ -10,6 +10,7 @@ ENV/
 env/
 dist/
 dist-new/
+dist-v3/
 build/
 *.egg-info/
 
@@ -31,6 +32,7 @@ service_account.json
 logs/
 state/
 *.log
+*.db
 
 # JSON temp files
 *.json
@@ -44,6 +46,12 @@ dist/
 src/clients/
 src/utils/index.ts
 src/index.ts
+
+# Tests
+.pytest_cache/
+.pytest_cache/
+.mypy_cache/
+tests/__pycache__/
 
 # OS
 .DS_Store

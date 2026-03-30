@@ -1,286 +1,321 @@
 """
-Google Sheets integration for storing and managing reviews.
-Uses gspread library with OAuth2 credentials.
+Google Sheets integration — EXPORT ONLY, not primary data store.
+
+Design principles:
+- Primary data lives in SQLite (StateStore)
+- Sheets = read-only reporting / export target
+- Batched writes (up to 100 rows/API call)
+- Rate-limit backoff
+- Service Account auth ONLY (no OAuth2 confusion)
+
+Auth setup:
+1. Go to console.cloud.google.com
+2. Enable Google Sheets API + Google Drive API
+3. Create a Service Account
+4. Download JSON key → save as credentials.json in app folder
+5. Share the spreadsheet with the service account email
 """
 
 import os
-import json
+import time
+import logging
 from datetime import datetime
 from typing import Any
-from google.oauth2 import service_account
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
-import gspread
 
-# Google Sheets scopes
+import gspread
+from google.oauth2 import service_account
+
+logger = logging.getLogger("review_bot")
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+SPREADSHEET_ID = "1SRgHk2KukTyja0dY5JnbLIiTG9PQwtm17KexQZrEIyo"
+SERVICE_ACCOUNT_FILE = "credentials.json"
+SHEET_REVIEWS = "Reviews"
+SHEET_RESPONSES = "Responses"
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
 ]
 
-
-class SheetsConfig:
-    """Configuration for Google Sheets integration."""
-
-    # Your spreadsheet URL: https://docs.google.com/spreadsheets/d/1SRgHk2KukTyja0dY5JnbLIiTG9PQwtm17KexQZrEIyo/edit
-    SPREADSHEET_ID = "1SRgHk2KukTyja0dY5JnbLIiTG9PQwtm17KexQZrEIyo"
-
-    # Credentials file (OAuth2 JSON from Google Cloud Console)
-    CREDENTIALS_FILE = "credentials.json"
-
-    # Token file (auto-generated after first auth)
-    TOKEN_FILE = "token.json"
-
-    # Sheet names
-    REVIEWS_SHEET = "Reviews"
-    RESPONSES_SHEET = "Responses"
-    SETTINGS_SHEET = "Settings"
+# Sheets API limits
+BATCH_SIZE = 100          # rows per API call
+RATE_LIMIT_DELAY = 1.1   # seconds between batches (Sheets = 60 req/min)
+MAX_RETRIES = 3
 
 
-def get_gspread_client() -> gspread.Client:
+# ── Auth ───────────────────────────────────────────────────────────────────────
+
+def _get_client() -> gspread.Client:
     """
-    Get authenticated gspread client.
-    Handles both OAuth2 and Service Account authentication.
+    Returns authenticated gspread client using Service Account.
+    Raises clear error if credentials are missing/invalid.
     """
-    creds = None
-
-    # Method 1: Try loading existing token
-    if os.path.exists(SheetsConfig.TOKEN_FILE):
-        creds = Credentials.from_authorized_user_info(
-            json.load(open(SheetsConfig.TOKEN_FILE)),
-            SCOPES
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        raise FileNotFoundError(
+            f"Service Account credentials not found.\n"
+            f"Expected file: {SERVICE_ACCOUNT_FILE}\n"
+            f"Download from: Google Cloud Console → IAM → Service Accounts → Keys\n"
+            f"Share spreadsheet with the service account email first."
         )
 
-    # Method 2: Try service account credentials
-    if not creds or not creds.valid:
-        if os.path.exists(SheetsConfig.CREDENTIALS_FILE):
-            creds = service_account.Credentials.from_service_account_file(
-                SheetsConfig.CREDENTIALS_FILE, scopes=SCOPES
-            )
-            return gspread.authorize(creds)
-
-    # Method 3: Try refreshing
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-
-        # Save refreshed token
-        with open(SheetsConfig.TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
-
-    if not creds or not creds.valid:
-        raise Exception(
-            "No valid Google credentials found. Please set up:\n"
-            "1. Download OAuth2 credentials from Google Cloud Console\n"
-            "2. Save as 'credentials.json' in the app folder\n"
-            "OR create a Service Account and save as 'service_account.json'"
-        )
-
-    return gspread.authorize(creds)
-
-
-def get_or_create_spreadsheet(client: gspread.Client) -> gspread.Spreadsheet:
-    """
-    Get the spreadsheet by ID, or create a new one if it doesn't exist.
-    """
     try:
-        spreadsheet = client.open_by_key(SheetsConfig.SPREADSHEET_ID)
-        print(f"Opened existing spreadsheet: {spreadsheet.title}")
-        return spreadsheet
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES
+        )
+        client = gspread.authorize(creds)
+        logger.info("Google Sheets client authenticated (Service Account)")
+        return client
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to authenticate with Google Sheets: {e}\n"
+            f"Verify: (1) credentials.json is valid, "
+            f"(2) Sheets API is enabled, "
+            f"(3) spreadsheet is shared with service account email."
+        ) from e
+
+
+# ── Spreadsheet access ─────────────────────────────────────────────────────────
+
+def get_spreadsheet(client: gspread.Client) -> gspread.Spreadsheet:
+    """Open spreadsheet by ID."""
+    try:
+        return client.open_by_key(SPREADSHEET_ID)
     except gspread.SpreadsheetNotFound:
-        print(f"Spreadsheet not found. Creating new spreadsheet...")
-        spreadsheet = client.create("Review Management - Auto Reply")
+        raise gspread.SpreadsheetNotFound(
+            f"Spreadsheet '{SPREADSHEET_ID}' not found.\n"
+            f"Create it at: https://docs.google.com/spreadsheets/create"
+        )
 
-        # Share with the email from credentials
+
+def _get_or_create_worksheet(
+    spreadsheet: gspread.Spreadsheet, name: str, headers: list[str]
+) -> gspread.Worksheet:
+    """Get existing worksheet or create with headers."""
+    try:
+        return spreadsheet.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(name, rows=1000, cols=len(headers))
+        ws.update("A1", [headers])
+        ws.format("A1", {
+            "backgroundColor": {"red": 0.15, "green": 0.35, "blue": 0.65},
+            "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
+        })
+        logger.info(f"Created worksheet: {name}")
+        return ws
+
+
+def ensure_sheets(spreadsheet: gspread.Spreadsheet) -> None:
+    """Ensure both required worksheets exist with correct headers."""
+    _get_or_create_worksheet(
+        spreadsheet, SHEET_REVIEWS,
+        ["Review ID", "Source", "Location", "Reviewer", "Rating",
+         "Date", "Review Text (truncated)", "Status", "AI Reply", "Processed At"]
+    )
+    _get_or_create_worksheet(
+        spreadsheet, SHEET_RESPONSES,
+        ["Review ID", "Source", "Location", "Reviewer", "Rating",
+         "Original Review", "AI Response", "Posted At"]
+    )
+    logger.info("All sheets verified.")
+
+
+# ── Core export functions ───────────────────────────────────────────────────────
+
+def export_reviews_to_sheet(
+    spreadsheet: gspread.Spreadsheet,
+    reviews: list[dict[str, Any]],
+    on_progress: callable = None,
+) -> dict[str, int]:
+    """
+    Batch-export reviews to the Reviews sheet.
+
+    Data is already in SQLite — this only writes to Sheets for reporting.
+    Batches rows to stay within Sheets rate limits.
+
+    Args:
+        spreadsheet: open gspread Spreadsheet object
+        reviews: list of review dicts (from SQLite or workflow)
+        on_progress: optional callback(str) for UI updates
+
+    Returns:
+        {"exported": N, "skipped": M, "errors": K}
+    """
+    if not reviews:
+        logger.info("No reviews to export to Sheets")
+        return {"exported": 0, "skipped": 0, "errors": 0}
+
+    sheet = _get_or_create_worksheet(
+        spreadsheet, SHEET_REVIEWS,
+        ["Review ID", "Source", "Location", "Reviewer", "Rating",
+         "Date", "Review Text (truncated)", "Status", "AI Reply", "Processed At"]
+    )
+
+    # Get current row count for append position (cached, not re-read every row)
+    try:
+        row_count = int(sheet.acell("A1").value or 1)
+        if row_count < 1:
+            row_count = 1
+    except Exception:
+        row_count = 1  # fallback: start from row 1 (after header)
+
+    results = {"exported": 0, "skipped": 0, "errors": 0}
+    batch: list[list] = []
+
+    for i, r in enumerate(reviews):
         try:
-            spreadsheet.share("", perm_type="anyone", role="writer")
-            print(f"Created and shared new spreadsheet: {spreadsheet.id}")
-        except:
-            pass
+            rating = r.get("rating", 0)
+            stars = "⭐" * (rating if isinstance(rating, int) else 0)
 
-        return spreadsheet
+            row = [
+                str(r.get("review_key", "")),
+                str(r.get("source", "")),
+                str(r.get("location_name", "")),
+                str(r.get("reviewer_name", "")),
+                stars,
+                str(r.get("date", "")),
+                (r.get("text", "") or "")[:500],
+                str(r.get("status", "Pending")),
+                (r.get("ai_reply", "") or "")[:500],
+                str(r.get("processed_at", "")),
+            ]
+            batch.append(row)
 
+            if len(batch) >= BATCH_SIZE:
+                _write_batch(sheet, row_count, batch)
+                results["exported"] += len(batch)
+                row_count += len(batch)
+                batch = []
 
-def setup_sheets(spreadsheet: gspread.Spreadsheet) -> None:
-    """
-    Set up the spreadsheet with proper headers and formatting.
-    Creates sheets if they don't exist.
-    """
-    # Create Reviews sheet
-    try:
-        reviews_sheet = spreadsheet.worksheet(SheetsConfig.REVIEWS_SHEET)
-    except gspread.WorksheetNotFound:
-        reviews_sheet = spreadsheet.add_worksheet(
-            SheetsConfig.REVIEWS_SHEET, rows=1000, cols=10
-        )
-        # Set headers
-        reviews_sheet.update(
-            "A1:J1",
-            [["ID", "Source", "Business", "Reviewer", "Rating", "Date",
-              "Review Text", "Reply Status", "AI Reply", "Scraped At"]]
-        )
-        # Format header row
-        reviews_sheet.format("A1:J1", {
-            "backgroundColor": {"red": 0.2, "green": 0.4, "blue": 0.8},
-            "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
-        })
+                msg = f"Exported {results['exported']}/{len(reviews)} reviews to Sheets..."
+                logger.info(msg)
+                if on_progress:
+                    on_progress(msg)
 
-    # Create Responses sheet
-    try:
-        responses_sheet = spreadsheet.worksheet(SheetsConfig.RESPONSES_SHEET)
-    except gspread.WorksheetNotFound:
-        responses_sheet = spreadsheet.add_worksheet(
-            SheetsConfig.RESPONSES_SHEET, rows=1000, cols=8
-        )
-        responses_sheet.update(
-            "A1:H1",
-            [["Review ID", "Source", "Business", "Reviewer", "Rating",
-              "Original Review", "AI Response", "Posted At"]]
-        )
-        responses_sheet.format("A1:H1", {
-            "backgroundColor": {"red": 0.2, "green": 0.6, "blue": 0.2},
-            "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
-        })
+        except Exception as e:
+            results["errors"] += 1
+            logger.error(f"Failed to prepare row for review {r.get('review_key', '?')}: {e}")
 
-    print("Sheets setup complete!")
+    # Flush remaining batch
+    if batch:
+        try:
+            _write_batch(sheet, row_count, batch)
+            results["exported"] += len(batch)
+        except Exception as e:
+            results["errors"] += len(batch)
+            logger.error(f"Batch write failed: {e}")
+
+    logger.info(
+        f"Sheets export done: exported={results['exported']} "
+        f"skipped={results['skipped']} errors={results['errors']}"
+    )
+    return results
 
 
-def save_reviews_to_sheet(spreadsheet: gspread.Spreadsheet, reviews: list[dict[str, Any]]) -> int:
-    """
-    Save reviews to the Reviews sheet.
-    Appends new reviews, skips duplicates based on review ID.
-    """
-    try:
-        sheet = spreadsheet.worksheet(SheetsConfig.REVIEWS_SHEET)
-    except gspread.WorksheetNotFound:
-        setup_sheets(spreadsheet)
-        sheet = spreadsheet.worksheet(SheetsConfig.REVIEWS_SHEET)
-
-    # Get existing review IDs to avoid duplicates
-    existing_ids = set()
-    try:
-        existing = sheet.col_values(1)  # Column A = ID
-        existing_ids = set(existing[1:])  # Skip header
-    except:
-        pass
-
-    # Filter new reviews
-    new_reviews = [r for r in reviews if r.get("id", "") not in existing_ids]
-
-    if not new_reviews:
-        print(f"No new reviews to save (all {len(reviews)} already exist)")
-        return 0
-
-    # Prepare rows
-    rows = []
-    for r in new_reviews:
-        rating_display = "⭐" * r.get("rating", 0)
-        rows.append([
-            r.get("id", ""),
-            r.get("source", ""),
-            r.get("business_name", ""),
-            r.get("reviewer_name", ""),
-            rating_display,
-            r.get("date", ""),
-            r.get("text", "")[:500],  # Truncate long text
-            r.get("reply_status", "Pending"),
-            r.get("ai_reply", ""),
-            r.get("scraped_at", ""),
-        ])
-
-    # Append to sheet
-    if rows:
-        sheet.append_rows(rows)
-        print(f"Saved {len(rows)} new reviews to Google Sheets")
-
-    return len(rows)
+def _write_batch(
+    sheet: gspread.Worksheet,
+    start_row: int,
+    rows: list[list],
+) -> None:
+    """Write a batch of rows with retry + backoff."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            end_row = start_row + len(rows) - 1
+            range_str = f"A{start_row}:J{end_row}"
+            sheet.update(range_str, rows)
+            time.sleep(RATE_LIMIT_DELAY)  # respect rate limits
+            return
+        except gspread.exceptions.APIError as e:
+            if e.response and e.response.status_code == 429:
+                wait = (attempt + 1) * 2.0
+                logger.warning(f"Sheets rate limit hit, backing off {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                raise RuntimeError(f"Batch write failed after {MAX_RETRIES} retries: {e}") from e
+            time.sleep(1)
 
 
-def save_response_to_sheet(
+def export_response(
     spreadsheet: gspread.Spreadsheet,
     review_id: str,
     source: str,
-    business_name: str,
+    location_name: str,
     reviewer_name: str,
     rating: int,
     original_review: str,
     ai_response: str,
-) -> None:
-    """Save a response to the Responses sheet."""
-    try:
-        sheet = spreadsheet.worksheet(SheetsConfig.RESPONSES_SHEET)
-    except gspread.WorksheetNotFound:
-        setup_sheets(spreadsheet)
-        sheet = spreadsheet.worksheet(SheetsConfig.RESPONSES_SHEET)
-
-    rating_display = "⭐" * rating
-
-    sheet.append_row([
-        review_id,
-        source,
-        business_name,
-        reviewer_name,
-        rating_display,
-        original_review[:500],
-        ai_response,
-        datetime.now().isoformat(),
-    ])
-
-    # Also update the Reviews sheet
-    try:
-        reviews_sheet = spreadsheet.worksheet(SheetsConfig.REVIEWS_SHEET)
-        # Find the row with this review ID and update reply status
-        cell = reviews_sheet.find(review_id)
-        if cell:
-            reviews_sheet.update_cell(cell.row, 8, "Replied")  # Column H = Reply Status
-            reviews_sheet.update_cell(cell.row, 9, ai_response[:500])  # Column I = AI Reply
-    except:
-        pass
-
-
-def get_all_reviews(spreadsheet: gspread.Spreadsheet) -> list[dict[str, Any]]:
-    """Get all reviews from the Reviews sheet."""
-    try:
-        sheet = spreadsheet.worksheet(SheetsConfig.REVIEWS_SHEET)
-        records = sheet.get_all_records()
-        return list(records)
-    except gspread.WorksheetNotFound:
-        return []
-
-
-def update_review_reply_status(
-    spreadsheet: gspread.Spreadsheet,
-    review_id: str,
-    ai_reply: str,
-    status: str = "Ready",
 ) -> bool:
-    """Update the reply status and AI reply for a review."""
+    """Export a single posted response to the Responses sheet."""
     try:
-        sheet = spreadsheet.worksheet(SheetsConfig.REVIEWS_SHEET)
-        cell = sheet.find(review_id)
-        if cell:
-            sheet.update_cell(cell.row, 8, status)  # Column H
-            sheet.update_cell(cell.row, 9, ai_reply[:500])  # Column I
-            return True
-    except:
-        pass
-    return False
+        sheet = _get_or_create_worksheet(
+            spreadsheet, SHEET_RESPONSES,
+            ["Review ID", "Source", "Location", "Reviewer", "Rating",
+             "Original Review", "AI Response", "Posted At"]
+        )
 
+        row = [
+            review_id,
+            source,
+            location_name,
+            reviewer_name,
+            "⭐" * rating,
+            original_review[:500],
+            ai_response,
+            datetime.now().isoformat(),
+        ]
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                sheet.append_row(row)
+                time.sleep(RATE_LIMIT_DELAY)
+                return True
+            except gspread.exceptions.APIError as e:
+                if e.response and e.response.status_code == 429:
+                    time.sleep((attempt + 1) * 2.0)
+                else:
+                    raise
+
+    except Exception as e:
+        logger.error(f"Failed to export response for {review_id}: {e}")
+        return False
+
+
+# ── Connection helper ─────────────────────────────────────────────────────────
+
+def connect() -> tuple[gspread.Client, gspread.Spreadsheet]:
+    """
+    One-call connect: returns (client, spreadsheet).
+    Use this in app.py instead of calling individual functions.
+    """
+    client = _get_client()
+    spreadsheet = get_spreadsheet(client)
+    ensure_sheets(spreadsheet)
+    return client, spreadsheet
+
+
+# ── CLI test ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Test connection
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+    logger.setLevel(logging.INFO)
+
     print("Testing Google Sheets connection...")
     try:
-        client = get_gspread_client()
-        spreadsheet = get_or_create_spreadsheet(client)
-        setup_sheets(spreadsheet)
-        print(f"Connected to: {spreadsheet.title}")
-        print(f"Spreadsheet URL: https://docs.google.com/spreadsheets/d/{spreadsheet.id}")
-    except Exception as e:
-        print(f"Connection failed: {e}")
-        print("\nTo set up Google Sheets integration:")
+        client, spreadsheet = connect()
+        print(f"✅ Connected to: {spreadsheet.title}")
+        print(f"   URL: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}")
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        print("\n📋 Setup guide:")
         print("1. Go to https://console.cloud.google.com")
-        print("2. Create a project or select existing one")
-        print("3. Enable Google Sheets API and Google Drive API")
-        print("4. Create OAuth2 credentials (Desktop app)")
-        print("5. Download and save as 'credentials.json' in the app folder")
+        print("2. Enable Google Sheets API + Google Drive API")
+        print("3. IAM → Service Accounts → Create (or use existing)")
+        print("4. Keys → Add Key → JSON → download")
+        print("5. Save as 'credentials.json' in the app folder")
+        print("6. Share the spreadsheet with the service account email")
+    except Exception as e:
+        print(f"❌ Connection failed: {e}")
