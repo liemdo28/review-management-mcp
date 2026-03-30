@@ -1,1 +1,12 @@
-requests
+requests==2.32.3
+python-dotenv==1.0.1
+pydantic==2.11.3
+tenacity==9.0.0
+openai>=1.0.0
+selenium>=4.0.0
+beautifulsoup4>=4.0.0
+webdriver-manager>=4.0.0
+gspread>=5.0.0
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0

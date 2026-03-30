@@ -1,18 +1,56 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
 .venv/
 venv/
-.env
-.idea/
-.vscode/.env 
-*.json 
-.env
-node_modules
-*.log
-*.json
-node_modules/
+ENV/
+env/
 dist/
+dist-new/
+build/
+*.egg-info/
+
+# Env files (CRITICAL - never commit secrets)
 .env
 .env.local
-claude-desktop-config.json
-*.local.json
+.env.example
+credentials.json
+token.json
+service_account.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and state
+logs/
+state/
+*.log
+
+# JSON temp files
+*.json
+!package.json
+!tsconfig.json
+!response-history.json
+
+# Node/TypeScript (MCP original)
+node_modules/
+dist/
+src/clients/
+src/utils/index.ts
+src/index.ts
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Spec files
+*.spec
+
+# Electron (deprecated)
+electron/
